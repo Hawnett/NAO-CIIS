@@ -82,7 +82,7 @@ class MyClass(GeneratedClass):
 5. Los valores que funcionen se pueden dejar fijos: en el bloque de Choregraphe o como `default` de `--offset-nao1` / `--offset-nao2`.
 
 Otros ajustes útiles:
-- `--pausa` (0.3 s entre líneas) y `--pausa-ambos` (0.4 s tras el "tres").
+- `--pausa` (0.1 s entre líneas) y `--pausa-ambos` (0.4 s tras el "tres"). Cada robot responde en cuanto el otro **deja de hablar** (evento `ALTextToSpeech/TextDone`), sin esperar a que termine su gesto. Para una conversación todavía más rápida, prueba `--pausa 0`.
 - `--velocidad`, `--volumen`, `--sin-gestos`, `--vida-autonoma no-tocar`.
 - `--animacion-saludo` para usar otra animación en el saludo.
 - En "¡Inauguramos…!" no hay animación: los robots levantan los brazos con los motores, sin ningún sonido, y los bajan al terminar la frase. La postura se ajusta en `BRAZOS_ARRIBA` y los tiempos en `TIEMPO_SUBIR_BRAZOS` / `TIEMPO_BAJAR_BRAZOS`, al inicio del script.

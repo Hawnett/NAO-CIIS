@@ -55,7 +55,7 @@ VELOCIDAD = 100             # Velocidad del habla en % (etiqueta \rspd=N\)
 VOLUMEN = 70                # Volumen general del robot (ALAudioDevice, 0-100)
 VOLUMEN_TTS = 1.0           # Volumen del motor TTS (0.0-1.0)
 
-PAUSA_ENTRE_LINEAS = 0.3    # s entre el fin de una línea y el inicio de la siguiente
+PAUSA_ENTRE_LINEAS = 0.1    # s entre que un robot deja de hablar y el otro empieza (conversación fluida)
 PAUSA_ANTES_DE_AMBOS = 0.4  # s entre el "tres" y la frase al unísono
 PAUSA_CUENTA_MS = 500       # Pausa TTS entre "Uno", "dos" y "tres"
 MUESTRAS_LATENCIA = 10      # Llamadas livianas para medir la latencia (mediana)
@@ -293,6 +293,38 @@ class FuturoQi(object):
         return None
 
 
+class FuturoVoz(object):
+    """Futuro de say() que termina cuando el robot deja de HABLAR (evento
+    ALTextToSpeech/TextDone), aunque el gesto de ALAnimatedSpeech siga moviéndose.
+    Así el siguiente robot puede responder sin esperar a que termine el gesto.
+    Si el evento no llega, se usa el final de la llamada como respaldo."""
+    def __init__(self, futuro, robot, t_lanzado, minimo):
+        self._f = futuro
+        self._robot = robot
+        self._t_lanzado = t_lanzado
+        self._minimo = minimo  # s: un TextDone antes de esto se ignora (ver decir)
+
+    def _fin_valido(self):
+        fin = self._robot._fin_voz
+        if fin is not None and fin - self._t_lanzado >= self._minimo:
+            return fin
+        return None
+
+    def terminado(self):
+        return self._fin_valido() is not None or self._f.terminado()
+
+    def instante_fin(self):
+        """Instante exacto en que dejó de hablar (o None si no llegó el evento)."""
+        return self._fin_valido()
+
+    def completo(self):
+        """True cuando también terminó el gesto (la llamada say() completa)."""
+        return self._f.terminado()
+
+    def error(self):
+        return self._f.error() if self._f.terminado() else None
+
+
 class FuturoListo(object):
     """Futuro ya terminado (p. ej. la llamada falló al lanzarse)."""
     def __init__(self, error=None):
@@ -333,6 +365,9 @@ class Robot(object):
         self.velocidad = VELOCIDAD
         self._servicios = {}
         self._comportamiento = None  # último comportamiento lanzado (para detenerlo)
+        self._fin_voz = None         # instante en que terminó de hablar (evento TextDone)
+        self._suscripcion_voz = None # (suscriptor, id) del evento TextDone
+        self._ultima_voz = None      # último FuturoVoz (para no pisar un gesto en curso)
 
     def etiqueta(self):
         return u"%s (%s)" % (self.nombre, _texto(self.ip))
@@ -641,19 +676,61 @@ class Robot(object):
             tiempos.append(_ahora_real() - t0)
         return _mediana(tiempos)
 
+    def escuchar_fin_de_voz(self):
+        """Se suscribe a ALTextToSpeech/TextDone para saber el instante exacto en
+        que el robot deja de hablar. Devuelve True si quedó suscrito."""
+        if self._suscripcion_voz is not None:
+            return True
+        try:
+            suscriptor = self.servicio("ALMemory").subscriber("ALTextToSpeech/TextDone")
+            ident = suscriptor.signal.connect(self._al_terminar_voz)
+            self._suscripcion_voz = (suscriptor, ident)  # guardar referencia: si no, se pierde
+            return True
+        except Exception:
+            return False
+
+    def _al_terminar_voz(self, valor):
+        # TextDone vale 1 al terminar un texto (0 al empezar)
+        try:
+            if valor and int(valor) == 1:
+                self._fin_voz = _ahora_real()
+        except Exception:
+            pass
+
+    def dejar_de_escuchar(self):
+        if self._suscripcion_voz is None:
+            return
+        try:
+            suscriptor, ident = self._suscripcion_voz
+            suscriptor.signal.disconnect(ident)
+        except Exception:
+            pass
+        self._suscripcion_voz = None
+
     def decir(self, texto, animacion=None, modo_cuerpo="contextual", sin_gestos=False):
         """Lanza say() de forma asíncrona y devuelve un futuro."""
         frase = u"\\rspd=%d\\ %s" % (self.velocidad, texto)
         animado = None if sin_gestos else self.servicio("ALAnimatedSpeech")
         try:
+            self._fin_voz = None  # se llenará con el evento TextDone de ESTA frase
+            t_lanzado = _ahora_real()
             if animado is None:
                 f = self._tts().say(_para_naoqi(frase), _async=True)
             else:
                 if animacion:
+                    # La etiqueta de animación va al principio: así no queda un trozo
+                    # de texto con solo "\rspd\" que dispare un TextDone anticipado
                     frase = u"^start(%s) %s ^wait(%s)" % (animacion, frase, animacion)
                 f = animado.say(_para_naoqi(frase),
                                 {"bodyLanguageMode": modo_cuerpo}, _async=True)
-            return FuturoQi(f)
+            if self._suscripcion_voz is None:
+                return FuturoQi(f)
+            # Seguridad: si ALAnimatedSpeech parte la frase en trozos, cada trozo
+            # dispara TextDone; solo se acepta uno pasado el 60 % de lo estimado.
+            # Si no llega uno válido, se espera al final de say() como antes.
+            minimo = 0.6 * estimar_duracion(texto, self.velocidad)
+            self._ultima_voz = FuturoVoz(FuturoQi(f), self, t_lanzado, minimo)
+            return self._ultima_voz
         except Exception as e:
             return FuturoListo(_texto(e))
 
@@ -739,6 +816,12 @@ class RobotSimulado(object):
     def volumen_efectos(self, volumen):
         return True
 
+    def escuchar_fin_de_voz(self):
+        return True
+
+    def dejar_de_escuchar(self):
+        pass
+
     def angulos_brazos(self):
         return [1.4, 0.2, -1.2, -0.5, 0.0, 0.3, 1.4, -0.2, 1.2, 0.5, 0.0, 0.3]
 
@@ -786,6 +869,7 @@ class ShowCIIS(object):
         self.animaciones = {}                    # {clave_robot: {"saludo": ruta, ...}}
         self.retrasos_ambos = {NAO1: 0.0, NAO2: 0.0}  # s
         self.baile = {NAO1: None, NAO2: None}         # rutas resueltas en la preparación
+        self._brazos_bajando = {}                     # futuros de la bajada tras la frase AMBOS
 
     # --- Registro ------------------------------------------------------------
     def log(self, mensaje=u""):
@@ -822,6 +906,9 @@ class ShowCIIS(object):
         except ShowInterrumpido:
             self.log(u"Show detenido.")
             return 130
+        finally:
+            for r in (self.nao1, self.nao2):
+                r.dejar_de_escuchar()
 
     def detener(self):
         """Ctrl+C o parada desde Choregraphe: callar y dejar de pie."""
@@ -867,6 +954,9 @@ class ShowCIIS(object):
             self.log(u"  %s: idioma %s, voz %s, velocidad %d%%, volumen %s, volumen TTS %.2f"
                      % (r.nombre, info["idioma"], info["voz"], r.velocidad,
                         info["volumen"], info["volumen_tts"]))
+            if not r.escuchar_fin_de_voz():
+                self.log(u"  AVISO: %s: no se pudo escuchar el fin de la voz (TextDone); "
+                         u"se esperará a que termine también el gesto." % r.nombre)
 
     def _identificar(self):
         self._titulo(u"Identificación")
@@ -926,8 +1016,6 @@ class ShowCIIS(object):
         estimado = sum(estimar_duracion(texto_para_tts(l), self.op.velocidad) for l in lineas)
         for l in lineas[1:]:
             estimado += self.op.pausa_ambos if l["hablante"] == AMBOS else self.op.pausa
-        if not self.op.sin_gestos and any(l["hablante"] == AMBOS for l in lineas):
-            estimado += TIEMPO_BAJAR_BRAZOS  # se espera a que bajen antes de seguir
         self.log(u"  Líneas %d a %d, discurso estimado: %.1f s (objetivo %d-%d s)%s"
                  % (self.op.desde, len(GUION), estimado,
                     DURACION_OBJETIVO[0], DURACION_OBJETIVO[1],
@@ -1050,6 +1138,7 @@ class ShowCIIS(object):
             if linea["requiere"] == "baile":
                 self.reloj.dormir_hasta(fin_anterior + self.op.pausa)
                 fin_anterior = self._baile(t_inicio)
+        self._terminar_bajada_brazos()
         fin = self.reloj.ahora()
         discurso = (fin_discurso if fin_discurso is not None else fin) - t_inicio
         if self.op.desde > 1:
@@ -1070,6 +1159,9 @@ class ShowCIIS(object):
         instante (misma compensación de latencia y offsets que la frase AMBOS).
         El baile termina cuando terminan los dos (o al cumplirse --duracion-max-baile)."""
         rutas = {NAO1: self.baile[NAO1], NAO2: self.baile[NAO2]}
+        self._terminar_bajada_brazos()  # el baile necesita los brazos libres
+        for r in (self.nao1, self.nao2):
+            self._esperar_robot_libre(r)
         self.log(u"[%s] +%6.2fs  BAILE  NAO 1: %s | NAO 2: %s"
                  % (self.reloj.hora(), self.reloj.ahora() - t_inicio, rutas[NAO1],
                     rutas[NAO2] or u"(de pie)"))
@@ -1136,12 +1228,38 @@ class ShowCIIS(object):
             return None
         return self.animaciones.get(robot.clave, {}).get(linea["animacion"])
 
+    def _esperar_robot_libre(self, robot, maximo=3.0):
+        """Si el gesto de su frase anterior sigue en curso, espera a que termine
+        (máx. 'maximo' s) para que la nueva frase no lo pise."""
+        previo = getattr(robot, "_ultima_voz", None)
+        if previo is None or not hasattr(previo, "completo"):
+            return
+        limite = self.reloj.ahora() + maximo
+        while not previo.completo() and self.reloj.ahora() < limite:
+            if self._abortar:
+                raise ShowInterrumpido()
+            self.reloj.dormir(0.005)
+
+    def _brazos_en_movimiento(self, robot):
+        f = self._brazos_bajando.get(robot.clave)
+        return f is not None and not f.terminado()
+
+    def _terminar_bajada_brazos(self):
+        """Espera a que terminen de bajar los brazos (antes del baile o al final)."""
+        if self._brazos_bajando:
+            self._esperar(self._brazos_bajando)
+            self._brazos_bajando = {}
+
     def _linea_turno(self, numero, linea, t_inicio):
         robot = self.robots[linea["hablante"]]
         texto = texto_para_tts(linea)
+        self._esperar_robot_libre(robot)
         self._cabecera(numero, linea, t_inicio)
         t0 = self.reloj.ahora()
-        fut = robot.decir(texto, self._animacion(robot, linea), "contextual", self.op.sin_gestos)
+        # Si sus brazos aún bajan tras la frase AMBOS, habla sin gestos automáticos
+        # (para no chocar con ese movimiento); si no, con gestos contextuales.
+        modo = "disabled" if self._brazos_en_movimiento(robot) else "contextual"
+        fut = robot.decir(texto, self._animacion(robot, linea), modo, self.op.sin_gestos)
         fin = self._esperar({robot.clave: fut})[robot.clave]
         if fut.error():
             # Plan B: repetir solo con ALTextToSpeech para que el show siga
@@ -1153,6 +1271,8 @@ class ShowCIIS(object):
 
     def _linea_ambos(self, numero, linea, t_inicio):
         texto = texto_para_tts(linea)
+        for r in (self.nao1, self.nao2):
+            self._esperar_robot_libre(r)
         self._cabecera(numero, linea, t_inicio)
         # Se lanza primero el robot con menor retraso; el otro, a su hora exacta
         orden = sorted((self.nao1, self.nao2), key=lambda r: self.retrasos_ambos[r.clave])
@@ -1177,14 +1297,14 @@ class ShowCIIS(object):
             for clave, f in brazos.items():
                 if f.error():
                     self.log(u"      AVISO: %s no pudo levantar los brazos: %s" % (NOMBRES[clave], f.error()))
-            # Al terminar la frase, bajan los dos juntos a la postura que tenían
-            bajada = {}
+            # Al terminar la frase, bajan los dos juntos a la postura que tenían.
+            # No se espera: la siguiente línea se dice mientras bajan.
+            self._brazos_bajando = {}
             for r in (self.nao1, self.nao2):
                 if reposo.get(r.clave):
-                    bajada[r.clave] = r.mover_brazos(reposo[r.clave], TIEMPO_BAJAR_BRAZOS)
-            self._esperar(bajada)
-            self.log(u"      Brazos arriba durante la frase y abajo al terminar (%s)"
-                     % u" y ".join(NOMBRES[k] for k in sorted(brazos)))
+                    self._brazos_bajando[r.clave] = r.mover_brazos(reposo[r.clave], TIEMPO_BAJAR_BRAZOS)
+            self.log(u"      Brazos arriba durante la frase; bajan en %g s mientras sigue el show (%s)"
+                     % (TIEMPO_BAJAR_BRAZOS, u" y ".join(NOMBRES[k] for k in sorted(brazos))))
         for r in (self.nao1, self.nao2):
             err = futuros[r.clave].error()
             self.log(u"      %s: lanzado +%.1f ms, terminó %s (+%.2fs), duración %.2f s%s"
@@ -1214,7 +1334,9 @@ class ShowCIIS(object):
                 raise ShowInterrumpido()
             for clave, f in futuros.items():
                 if clave not in fines and f.terminado():
-                    fines[clave] = self.reloj.ahora()
+                    # Con FuturoVoz se usa el instante exacto en que dejó de hablar
+                    exacto = f.instante_fin() if hasattr(f, "instante_fin") else None
+                    fines[clave] = exacto if exacto is not None else self.reloj.ahora()
             if len(fines) < len(futuros):
                 if self.reloj.ahora() > limite:
                     for clave in futuros:
